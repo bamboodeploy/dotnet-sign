@@ -9,6 +9,7 @@ static class Program
     const string DefaultBase = "https://api.bamboodeploy.com";
     const long DirectMax = 95L * 1024 * 1024;
     static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(30) };
+    static readonly int[] RetryDelays = [2, 5, 10, 20, 30];
     static bool Quiet, Json;
 
     static async Task<int> Main(string[] args)
@@ -34,6 +35,7 @@ static class Program
         }
         if (key is null) throw new BambooException("No API key. Set BAMBOO_API_KEY, pass --api-key, or put the key in .bamboorc", "no_key");
         Http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", key);
+        Http.DefaultRequestHeaders.UserAgent.ParseAdd($"bamboodeploy-dotnet/{typeof(Program).Assembly.GetName().Version!.ToString(3)}");
         var timeout = int.Parse(opt.GetValueOrDefault("timeout") ?? "900");
         var interval = int.Parse(opt.GetValueOrDefault("interval") ?? "10");
 
@@ -41,17 +43,50 @@ static class Program
         {
             case "sign":
             {
-                var file = pos.ElementAtOrDefault(0) ?? throw new BambooException("Usage: bamboo-sign sign <file>", "usage");
-                var up = await Upload(apiBase, file);
-                var id = up["id"]!.GetValue<string>();
-                Log($"App id: {id}{(up["duplicate"]?.GetValue<bool>() == true ? " (already uploaded)" : "")}");
-                var sign = await Req(HttpMethod.Post, $"{apiBase}/uploads/{id}/sign");
-                Log($"Sign job {sign["job_id"]}: {sign["status"]}");
-                await WaitForSign(apiBase, id, timeout, interval);
-                var dest = opt.GetValueOrDefault("out") ?? file;
-                var size = await Download(apiBase, id, dest);
-                Log($"Wrote {dest} ({Fmt(size)})");
-                Console.WriteLine(Json ? JsonSerializer.Serialize(new { ok = true, app_id = id, job_id = sign["job_id"]?.ToString(), @out = dest, size }) : $"Signed: {dest}");
+                if (pos.Count == 0) throw new BambooException("Usage: bamboo-sign sign <file>...", "usage");
+                var files = ExpandFiles(pos);
+                var multi = files.Count > 1;
+                var outOpt = opt.GetValueOrDefault("out");
+                if (multi && outOpt != null && files.Select(f => Path.GetFileName(f).ToLowerInvariant()).Distinct().Count() < files.Count)
+                    throw new BambooException("Two files share a name, so they can not both be written to one --out folder", "usage");
+                var jobs = new List<(string file, string tag, string id, string? jobId)>();
+                foreach (var file in files)
+                {
+                    var tag = multi ? Path.GetFileName(file) + ": " : "";
+                    var up = await Upload(apiBase, file);
+                    var id = up["id"]!.GetValue<string>();
+                    Log($"{tag}App id: {id}{(up["duplicate"]?.GetValue<bool>() == true ? " (already uploaded)" : "")}");
+                    var sign = await Req(HttpMethod.Post, $"{apiBase}/uploads/{id}/sign", retry: true);
+                    Log($"{tag}Sign job {sign["job_id"]}: {sign["status"]}");
+                    jobs.Add((file, tag, id, sign["job_id"]?.ToString()));
+                }
+                var waits = jobs.Select(j => WaitForSign(apiBase, j.id, timeout, interval, j.tag)).ToArray();
+                try { await Task.WhenAll(waits); } catch { }
+                var results = new JsonArray();
+                for (var i = 0; i < jobs.Count; i++)
+                {
+                    if (!waits[i].IsCompletedSuccessfully) continue;
+                    var j = jobs[i];
+                    var dest = outOpt is null ? j.file : multi ? Path.Combine(outOpt, Path.GetFileName(j.file)) : outOpt;
+                    var size = await Download(apiBase, j.id, dest);
+                    Log($"{j.tag}Wrote {dest} ({Fmt(size)})");
+                    results.Add(new JsonObject { ["file"] = j.file, ["app_id"] = j.id, ["job_id"] = j.jobId, ["out"] = dest, ["size"] = size });
+                    if (!Json) Console.WriteLine($"Signed: {dest}");
+                }
+                var bad = Array.FindIndex(waits, w => !w.IsCompletedSuccessfully);
+                if (bad >= 0)
+                {
+                    var inner = waits[bad].Exception!.InnerException!;
+                    var e = inner as BambooException ?? new BambooException(inner.Message, "error");
+                    throw new BambooException(jobs[bad].tag + e.Message, e.Code, e.Status, e.Body);
+                }
+                if (Json)
+                {
+                    var res = new JsonObject { ["ok"] = true };
+                    if (results.Count == 1) foreach (var kv in results[0]!.AsObject()) res[kv.Key] = kv.Value?.DeepClone();
+                    res["files"] = results;
+                    Console.WriteLine(res.ToJsonString());
+                }
                 return 0;
             }
             case "scan":
@@ -79,7 +114,7 @@ static class Program
             case "status":
             {
                 var id = pos.ElementAtOrDefault(0);
-                var r = await Req(HttpMethod.Get, id is null ? $"{apiBase}/uploads?limit={opt.GetValueOrDefault("limit") ?? "20"}" : $"{apiBase}/uploads/{id}");
+                var r = await Req(HttpMethod.Get, id is null ? $"{apiBase}/uploads?limit={opt.GetValueOrDefault("limit") ?? "20"}" : $"{apiBase}/uploads/{id}", retry: true);
                 if (Json || id != null) Console.WriteLine(r.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
                 else foreach (var u in r["uploads"]!.AsArray())
                     Console.WriteLine($"{u!["id"]}  {u["file_name"],-32}  scan:{u["scan"]!["status"],-7} sign:{u["sign"]!["status"]}");
@@ -109,9 +144,11 @@ static class Program
             using var put = new HttpRequestMessage(HttpMethod.Put, init["upload_url"]!.GetValue<string>()) { Content = new StreamContent(stream) };
             put.Content.Headers.ContentLength = fi.Length;
             using var noAuth = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
-            var pr = await noAuth.SendAsync(put);
+            HttpResponseMessage pr;
+            try { pr = await noAuth.SendAsync(put); }
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException) { throw new BambooException($"Upload failed: {NetMsg(e)}", "network"); }
             if (!pr.IsSuccessStatusCode) throw new BambooException($"Upload failed: HTTP {(int)pr.StatusCode}", "http_error", (int)pr.StatusCode);
-            return await Req(HttpMethod.Post, $"{apiBase}/uploads/{init["id"]}/finalize?name={name}");
+            return await Req(HttpMethod.Post, $"{apiBase}/uploads/{init["id"]}/finalize?name={name}", retry: true);
         }
         var content = new StreamContent(stream);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
@@ -119,20 +156,20 @@ static class Program
         return await Req(HttpMethod.Post, $"{apiBase}/uploads?name={name}", content);
     }
 
-    static async Task WaitForSign(string apiBase, string id, int timeout, int interval)
+    static async Task WaitForSign(string apiBase, string id, int timeout, int interval, string tag = "")
     {
         var deadline = DateTime.UtcNow.AddSeconds(timeout);
         string? last = null;
         while (true)
         {
-            var s = await Req(HttpMethod.Get, $"{apiBase}/uploads/{id}");
+            var s = await Req(HttpMethod.Get, $"{apiBase}/uploads/{id}", retry: true);
             var sign = s["sign"]!.AsObject();
             var st = sign["status"]?.ToString() ?? "none";
             if (st != last)
             {
                 last = st;
                 var why = st == "pending" ? (sign["pending_reason"]?.ToString() == "operator_review" ? " (awaiting operator review)" : " (awaiting scan results)") : "";
-                Log($"Sign status: {st}{why}");
+                Log($"{tag}Sign status: {st}{why}");
             }
             if (st == "done") return;
             if (st is "failed" or "denied" or "canceled")
@@ -148,7 +185,7 @@ static class Program
         var deadline = DateTime.UtcNow.AddSeconds(timeout);
         while (true)
         {
-            var r = await Http.GetAsync($"{apiBase}/uploads/{id}/report");
+            using var r = await Send(() => new HttpRequestMessage(HttpMethod.Get, $"{apiBase}/uploads/{id}/report"), true);
             if (r.IsSuccessStatusCode) return await r.Content.ReadAsStringAsync();
             if ((int)r.StatusCode != 409) throw new BambooException($"HTTP {(int)r.StatusCode}", "http_error", (int)r.StatusCode);
             if (DateTime.UtcNow > deadline) throw new BambooException("Scan did not finish in time", "timeout");
@@ -158,20 +195,63 @@ static class Program
 
     static async Task<long> Download(string apiBase, string id, string dest)
     {
-        using var r = await Http.GetAsync($"{apiBase}/uploads/{id}/download?variant=signed", HttpCompletionOption.ResponseHeadersRead);
-        if (!r.IsSuccessStatusCode) throw new BambooException($"Download failed: HTTP {(int)r.StatusCode}", "http_error", (int)r.StatusCode);
         var full = Path.GetFullPath(dest);
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);
         var tmp = full + ".bamboo-tmp";
-        await using (var fs = File.Create(tmp)) await r.Content.CopyToAsync(fs);
+        for (var attempt = 0; ; attempt++)
+        {
+            using var r = await Send(() => new HttpRequestMessage(HttpMethod.Get, $"{apiBase}/uploads/{id}/download?variant=signed"), true, HttpCompletionOption.ResponseHeadersRead);
+            if (!r.IsSuccessStatusCode) throw new BambooException($"Download failed: HTTP {(int)r.StatusCode}", "http_error", (int)r.StatusCode);
+            try
+            {
+                await using (var fs = File.Create(tmp)) await r.Content.CopyToAsync(fs);
+                break;
+            }
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException)
+            {
+                File.Delete(tmp);
+                if (attempt >= RetryDelays.Length) throw new BambooException($"Download failed: {NetMsg(e)}", "network");
+                await Backoff(attempt, $"Download interrupted ({NetMsg(e)})");
+            }
+        }
         File.Move(tmp, full, true);
         return new FileInfo(full).Length;
     }
 
-    static async Task<JsonObject> Req(HttpMethod method, string url, HttpContent? content = null)
+    static string NetMsg(Exception e) => e is TaskCanceledException ? "request timed out" : e.InnerException?.Message ?? e.Message;
+
+    static async Task Backoff(int attempt, string why)
     {
-        using var req = new HttpRequestMessage(method, url) { Content = content };
-        using var res = await Http.SendAsync(req);
+        Log($"{why}, retrying in {RetryDelays[attempt]}s");
+        await Task.Delay(RetryDelays[attempt] * 1000);
+    }
+
+    static async Task<HttpResponseMessage> Send(Func<HttpRequestMessage> make, bool retry, HttpCompletionOption completion = HttpCompletionOption.ResponseContentRead)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            using var req = make();
+            HttpResponseMessage res;
+            try { res = await Http.SendAsync(req, completion); }
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException)
+            {
+                if (retry && attempt < RetryDelays.Length) { await Backoff(attempt, $"Network error ({NetMsg(e)})"); continue; }
+                throw new BambooException($"Network error: {NetMsg(e)}", "network");
+            }
+            var code = (int)res.StatusCode;
+            if (retry && (code == 429 || code >= 500) && attempt < RetryDelays.Length)
+            {
+                res.Dispose();
+                await Backoff(attempt, $"HTTP {code}");
+                continue;
+            }
+            return res;
+        }
+    }
+
+    static async Task<JsonObject> Req(HttpMethod method, string url, HttpContent? content = null, bool retry = false)
+    {
+        using var res = await Send(() => new HttpRequestMessage(method, url) { Content = content }, retry);
         var text = await res.Content.ReadAsStringAsync();
         JsonObject body;
         try { body = JsonNode.Parse(text)!.AsObject(); } catch { body = new JsonObject { ["error"] = text[..Math.Min(300, text.Length)] }; }
@@ -205,7 +285,12 @@ static class Program
         var valued = new HashSet<string> { "out", "timeout", "interval", "limit", "api-key", "api-base" };
         for (var i = 0; i < args.Length; i++)
         {
-            if (args[i].StartsWith("--"))
+            if (args[i].StartsWith("--") && args[i].Contains('='))
+            {
+                var eq = args[i].IndexOf('=');
+                opt[args[i][2..eq]] = args[i][(eq + 1)..];
+            }
+            else if (args[i].StartsWith("--"))
             {
                 var k = args[i][2..];
                 opt[k] = valued.Contains(k) && i + 1 < args.Length ? args[++i] : "true";
@@ -220,16 +305,39 @@ static class Program
     static int Fail(BambooException e)
     {
         var code = e.Code switch { "premium_required" => 2, "connections_required" => 3, "timeout" => 4, _ => 1 };
-        if (Json) Console.WriteLine(JsonSerializer.Serialize(new { ok = false, error = e.Code, message = e.Message }));
+        if (Json)
+        {
+            var o = new JsonObject { ["ok"] = false, ["error"] = e.Code, ["message"] = e.Message };
+            if (e.Body != null) foreach (var kv in e.Body) o[kv.Key] = kv.Value?.DeepClone();
+            Console.WriteLine(o.ToJsonString());
+        }
         else
         {
             Console.Error.WriteLine($"Error: {e.Message}");
             if (e.Code == "premium_required") Console.Error.WriteLine("Upgrade at https://www.bamboodeploy.com/dashboard/#billing");
             if (e.Code == "connections_required") Console.Error.WriteLine("Verify your publisher connections at https://www.bamboodeploy.com/dashboard/");
             if (e.Code == "timeout" && e.Body?["sign"]?["pending_reason"]?.ToString() == "operator_review")
-                Console.Error.WriteLine("The job is waiting for operator review. Re-run once approved, or ask Bamboo to enable Auto-sign on your account so clean builds sign without review.");
+                Console.Error.WriteLine("The job is waiting for operator review. Re-run once approved.");
         }
         return code;
+    }
+
+    static List<string> ExpandFiles(List<string> args)
+    {
+        var found = new Dictionary<string, string>();
+        foreach (var a in args)
+        {
+            var hits = new List<string> { a };
+            if (a.IndexOfAny(['*', '?']) >= 0 && !File.Exists(a))
+            {
+                var dir = Path.GetDirectoryName(a);
+                var d = string.IsNullOrEmpty(dir) ? "." : dir;
+                hits = Directory.Exists(d) ? Directory.GetFiles(d, Path.GetFileName(a)).Select(p => string.IsNullOrEmpty(dir) ? Path.GetFileName(p) : p).Order().ToList() : [];
+                if (hits.Count == 0) throw new BambooException($"No files match {a}", "usage");
+            }
+            foreach (var h in hits) found.TryAdd(Path.GetFullPath(h).ToLowerInvariant(), h);
+        }
+        return found.Values.ToList();
     }
 
     static void Log(string m) { if (!Quiet && !Json) Console.Error.WriteLine(m); }
@@ -238,7 +346,7 @@ static class Program
     const string Help = @"bamboo-sign  Scan and code-sign Windows binaries via Bamboo Deploy
 
 Usage:
-  bamboo-sign sign <file> [--out <path>] [--timeout 900] [--interval 10]
+  bamboo-sign sign <file>... [--out <path>] [--timeout 900] [--interval 10]
   bamboo-sign scan <file> [--json] [--fail-on-findings]
   bamboo-sign status [app-id]
   bamboo-sign delete <app-id>
@@ -246,11 +354,15 @@ Usage:
 
 Options:
   --api-key <key>   API key (else BAMBOO_API_KEY env or .bamboorc)
-  --out <path>      Where to write the signed file (default: replace input)
+  --out <path>      Where to write the signed file (default: replace input).
+                    With several files, a folder
   --timeout <s>     Max seconds to wait for signing (default 900)
   --interval <s>    Poll interval in seconds (default 10)
   --json            Machine-readable output
   --quiet           No progress output
+  --api-base <url>  API base URL (else BAMBOO_API_BASE)
+
+Sign several files at once: bamboo-sign sign dist/app.exe ""dist/*.dll""
 
 Exit codes: 0 ok, 1 error, 2 premium required, 3 verification required, 4 timeout or pending review, 5 scan findings";
 }

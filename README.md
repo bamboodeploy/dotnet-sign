@@ -1,6 +1,6 @@
 # BambooDeploy.Sign
 
-Scan and code-sign Windows `.exe` and `.msi` files from `dotnet publish`, MSBuild, or any build script. No certificate to buy, no hardware token, no Windows VM. Files are signed with the Bamboo Deploy certificate after a malware scan, so the publisher shown to users is Bamboo Deploy.
+Scan and code-sign Windows `.exe` and `.msi` files from `dotnet publish`, MSBuild, or any build script. No certificate to buy, no hardware token, no Windows VM. Files are signed with the Bamboo Deploy certificate after a malware scan, so the publisher shown to users is ours, not yours.
 
 ```bash
 dotnet tool install -g BambooDeploy.Sign
@@ -30,12 +30,14 @@ Works with WPF, WinForms, WinUI, console apps, and `PublishSingleFile`. For an i
 ## Commands
 
 ```
-bamboo-sign sign <file> [--out path] [--timeout 900]   sign, replace in place by default
+bamboo-sign sign <file>... [--out path] [--timeout 900] sign, replace in place by default
 bamboo-sign scan <file> [--json] [--fail-on-findings]  free: scan report + SmartScreen readiness
 bamboo-sign status [app-id]                            list uploads, or one app's scan + sign state
 bamboo-sign delete <app-id>
 bamboo-sign config                                     show which key and API base are in use
 ```
+
+Several files at once: `bamboo-sign sign dist/app.exe "dist/*.dll"`. Each file is signed, and with `--out` they go into that folder. Wildcards work in any shell, including PowerShell and cmd. Status checks and downloads retry on network errors.
 
 Exit codes: `0` ok, `1` error, `2` Premium required, `3` publisher verification required, `4` timeout or waiting for review, `5` scan findings (with `--fail-on-findings`).
 

@@ -8,7 +8,8 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>bamboo-sign</ToolCommandName>
     <PackageId>BambooDeploy.Sign</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
+    <ContinuousIntegrationBuild Condition="'$(Configuration)' == 'Release'">true</ContinuousIntegrationBuild>
     <Authors>Bamboo Deploy</Authors>
     <Company>Bamboo Deploy</Company>
     <Description>Scan and code-sign Windows .exe and .msi files from dotnet publish, MSBuild, or any build script via the Bamboo Deploy API. No certificate or hardware token to manage.</Description>
